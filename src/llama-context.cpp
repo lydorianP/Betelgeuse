@@ -162,8 +162,14 @@ static void start_doorbell_worker(llama_context * ctx) {
         std::vector<char>    read_fail, done;
         long served = 0, failed = 0;
         long n_hit = 0, n_sel = 0;
+        long last_hit = 0, last_sel = 0;
+        std::vector<long> lyr_hit((size_t) n_layer, 0), lyr_sel((size_t) n_layer, 0);
         double t_read = 0.0, t_wait = 0.0;
         long n_read = 0;
+        long n_dec_steps = 0;
+        FILE * tf = nullptr;
+        bool tf_init = false;
+        std::vector<uint16_t> tbuf;
 
         const char * prekick_env = getenv("MOE_PREKICK");
         const char * split_env = getenv("MOE_SPLIT");
@@ -291,16 +297,19 @@ static void start_doorbell_worker(llama_context * ctx) {
                 sel.resize((size_t) n);
                 misses.clear();
                 misses.reserve((size_t) n);
+                const bool dec_sel = (n == n_used);
                 for (int j = 0; j < n; ++j) {
                     const int32_t e = pl->sel[j];
                     sel[(size_t) j] = e;
                     if (e < 0 || e >= n_exp) continue;
                     n_sel++;
+                    if (dec_sel) lyr_sel[(size_t) il]++;
                     const int cur = ctx->moe.slot_of[(size_t) il * n_exp + e];
                     if (cur >= base && cur < base + s_pl) {
                         pinned[(size_t) cur - (size_t) base] = 1;
                         ctx->moe.lru.hit((size_t) cur);
                         n_hit++;
+                        if (dec_sel) lyr_hit[(size_t) il]++;
                     } else {
                         misses.push_back(e);
                     }
@@ -408,6 +417,33 @@ static void start_doorbell_worker(llama_context * ctx) {
                         if (e < 0 || e >= n_exp) continue;
                         ctx->moe.step_sel[(size_t) il * n_used + j] = e;
                         ctx->moe.dec_freq[(size_t) il * n_exp + e]++;
+                    }
+                    // optional routing trace (same format as the sync path):
+                    // one u16 row [n_used] per layer per decode step.
+                    if (!tf_init) {
+                        tf_init = true;
+                        const char * p = getenv("MOE_TRACE_DIR");
+                        if (p && p[0]) tf = fopen((std::string(p) + ".ids.u16").c_str(), "wb");
+                    }
+                    if (tf) {
+                        if (tbuf.empty()) tbuf.assign((size_t) n_layer * n_used, 0);
+                        for (int j = 0; j < n; ++j) {
+                            const int32_t e = sel[(size_t) j];
+                            tbuf[(size_t) il * n_used + j] = (e >= 0 && e < 65536) ? (uint16_t) e : 0;
+                        }
+                        if (il == n_layer - 1) {
+                            fwrite(tbuf.data(), 2, tbuf.size(), tf);
+                            fflush(tf);
+                        }
+                    }
+                    // self-learning profile: the worker owns dec_freq, so it is
+                    // the only place that can snapshot it in the doorbell path.
+                    if (il == n_layer - 1 && (++n_dec_steps % 64) == 0) {
+                        const char * out = getenv("MOE_HOT_PROFILE_OUT");
+                        if (out && out[0]) {
+                            ctx->moe_hot_save();
+                            LLAMA_LOG_INFO("[doorbell] learned profile saved to %s at step %ld\n", out, n_dec_steps);
+                        }
                     }
                 }
 
@@ -726,12 +762,28 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 if ((served % 512) == 0) {
                     log_io();
+                    const long win_hit = n_hit - last_hit, win_sel = n_sel - last_sel;
+                    last_hit = n_hit; last_sel = n_sel;
                     LLAMA_LOG_DEBUG("[doorbell] served=%ld layer=%d n=%d miss=%zu copy=%d failed=%ld "
-                            "hit=%.1f%% read=%.2f ms/expert wait=%.2f ms/expert\n",
+                            "hit=%.1f%% win_hit=%.1f%% read=%.2f ms/expert wait=%.2f ms/expert\n",
                             served, il, n, misses.size(), ncopy, failed,
                             n_sel ? 100.0 * (double) n_hit / (double) n_sel : 0.0,
+                            win_sel ? 100.0 * (double) win_hit / (double) win_sel : 0.0,
                             n_read ? t_read / n_read : 0.0,
                             n_read ? t_wait / n_read : 0.0);
+                    if (getenv("MOE_LOG_LAYER_HIT")) {
+                        std::string s;
+                        long ds = 0, dh = 0;
+                        for (int l = 0; l < n_layer; ++l) {
+                            char b[24];
+                            snprintf(b, sizeof b, "%s%ld", l ? " " : "", lyr_sel[(size_t) l] - lyr_hit[(size_t) l]);
+                            s += b;
+                            ds += lyr_sel[(size_t) l];
+                            dh += lyr_hit[(size_t) l];
+                        }
+                        LLAMA_LOG_DEBUG("[doorbell_layer_hit] served=%ld dec_sel=%ld dec_miss=%ld %s\n",
+                                served, ds, ds - dh, s.c_str());
+                    }
                     t_read = t_wait = 0.0;
                     n_read = 0;
                     if (spec_ok) {
@@ -1423,9 +1475,23 @@ static inline int moe_fixed_slots(int il, int n_layer) {
         80, 88, 128, 80, 80, 80, 88, 80, 80, 80, 80, 88,
     };
     if (profiled && n_layer == 48 && il >= 0 && il < n_layer) return profiled_slots[il];
-    if (il >= 0 && il < 5) return 220;
-    if (il >= 5 && il < 43) return 92;
-    if (il >= 43 && il < n_layer) return 80;
+    // Non-profiled fallback, with MOE_FRONT_SLOTS / MOE_DEEP_SLOTS overrides.
+    // The first MoE layers route to a narrow expert set (trace: 15-61 distinct
+    // experts over 231 decode steps) and the deep layers spread out (158-222),
+    // so a rebalanced split looks better on a no-seed LRU trace simulation
+    // (91.8% -> 95.0%). Measured with a seeded profile it does not: decode hit
+    // was 95.9% (220/92) vs 95.2% (96/110), and a smaller front tier also
+    // lowers the ubatch cap (min_slots / top-k). Keep the historical split.
+    static const int front_slots = [] {
+        const char * e = getenv("MOE_FRONT_SLOTS");
+        return e && atoi(e) > 0 ? atoi(e) : 220;
+    }();
+    static const int deep_slots = [] {
+        const char * e = getenv("MOE_DEEP_SLOTS");
+        return e && atoi(e) > 0 ? atoi(e) : 92;
+    }();
+    if (il >= 0 && il < 5) return front_slots;
+    if (il >= 5 && il < n_layer) return deep_slots;
     return 104;
 }
 static inline int moe_get_layer_slots(int il, int n_layer) {
@@ -1716,10 +1782,18 @@ llama_context::llama_context(
             min_slots = std::min(min_slots, moe_get_layer_slots(il, n_layer));
         }
         const uint32_t safe = (uint32_t) std::max(1, min_slots / n_used);
-        if (cparams.n_ubatch > safe) {
+        // Intra-layer 8-token slicing pages one slice at a time, so what must
+        // fit the smallest pool is the per-slice union (<= 8 * top-k), not the
+        // whole ubatch. Allow an explicit, testable override.
+        uint32_t cap = safe;
+        const char * ub_env = getenv("MOE_UBATCH_MAX");
+        if (ub_env && atoi(ub_env) > 0) {
+            cap = (uint32_t) std::min(atoi(ub_env), 64);
+        }
+        if (cparams.n_ubatch > cap) {
             LLAMA_LOG_INFO("%s: moe slot pool caps n_ubatch at %u (requested %u, min slots %d, top-k %d)\n",
-                    __func__, safe, cparams.n_ubatch, min_slots, n_used);
-            cparams.n_ubatch = safe;
+                    __func__, cap, cparams.n_ubatch, min_slots, n_used);
+            cparams.n_ubatch = cap;
         }
     }
 
@@ -6714,8 +6788,11 @@ void llama_context::moe_page_batch_sorted(int il, const int32_t * sel, int n) {
 // per layer ≈ 70% cold-hit coverage (trace-measured).
 void llama_context::moe_hot_save() {
     if (!moe_ready) return;
+    // MOE_HOT_PROFILE_OUT is the explicit "save what this run learned" path;
+    // MOE_HOT_PROFILE is the legacy load/refresh path.
+    const char * out = getenv("MOE_HOT_PROFILE_OUT");
     const char * learned = getenv("MOE_HOT_PROFILE");
-    const char * lpath = (learned && learned[0]) ? learned : "data/moe_hot_profile.bin";
+    const char * lpath = (out && out[0]) ? out : ((learned && learned[0]) ? learned : "data/moe_hot_profile.bin");
     const int n_exp = moe.n_expert;
     const int per = 240;
     FILE * f = fopen(lpath, "wb");
