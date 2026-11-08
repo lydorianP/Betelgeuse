@@ -32,7 +32,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <cuda_runtime.h>
+#include "moe_cuda_compat.h"
 #include <liburing.h>
 #include <linux/ioprio.h>
 
@@ -1534,12 +1534,17 @@ llama_context::llama_context(
 
     cparams.moe_direct_io = params.moe_direct_io;
     cparams.moe_stripped_experts = model.stripped_experts;
+    // The MTP draft context builds only the NextN block, whose experts stay inline
+    // when the bundle was packed with --mtp-dense; it never touches the paged trunk.
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.mtp_dense) {
+        cparams.moe_stripped_experts = false;
+    }
     cparams.moe_slots     = params.moe_slots;
     cparams.moe_pack_dir  = params.moe_pack_dir;
     cparams.moe_chunk_max = params.moe_chunk_max;
     cparams.moe_gguf_path = params.moe_gguf_path ? params.moe_gguf_path : model.source_path.c_str();
     cparams.moe_profile_path = params.moe_profile_path;
-    if (model.stripped_experts && (!cparams.moe_direct_io || !cparams.moe_pack_dir || !cparams.moe_pack_dir[0])) {
+    if (cparams.moe_stripped_experts && (!cparams.moe_direct_io || !cparams.moe_pack_dir || !cparams.moe_pack_dir[0])) {
         throw std::runtime_error("stripped expert model requires --moe-direct-io and --moe-pack-dir");
     }
     if (params.moe_direct_io) {
@@ -2107,7 +2112,7 @@ llama_context::llama_context(
             } // pager init else
         } // moe_direct_io if
         } // moe_direct_io if
-        if (model.stripped_experts && (!moe_ready || !pager.pack_mode())) {
+        if (cparams.moe_stripped_experts && (!moe_ready || !pager.pack_mode())) {
             throw std::runtime_error("stripped expert model requires a working expert pack and paging pool");
         }
 

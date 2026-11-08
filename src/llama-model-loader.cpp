@@ -603,18 +603,23 @@ llama_model_loader::llama_model_loader(
                 throw std::runtime_error("unsupported stripped expert pack alignment");
             }
             std::string companion;
-            get_key("betelgeuse.ple_file", companion);
-            if (companion.empty() || companion == "." || companion == ".." ||
-                    companion.find_first_of("/\\:") != std::string::npos ||
-                    companion.find('\0') != std::string::npos || n_split != 2) {
-                throw std::runtime_error("invalid stripped bundle PLE companion metadata");
+            get_key("betelgeuse.ple_file", companion, false);
+            if (n_split == 2) {
+                if (companion.empty() || companion == "." || companion == ".." ||
+                        companion.find_first_of("/\\:") != std::string::npos ||
+                        companion.find('\0') != std::string::npos) {
+                    throw std::runtime_error("invalid stripped bundle PLE companion metadata");
+                }
+                const size_t slash = fname.find_last_of("/\\");
+                const std::string path = (slash == std::string::npos ? "" : fname.substr(0, slash + 1)) + companion;
+                if (!splits.empty() && (splits.size() != 2 || splits[0] != fname || splits[1] != path)) {
+                    throw std::runtime_error("stripped bundle split list conflicts with its PLE companion");
+                }
+                splits = { fname, path };
+            } else if (!companion.empty()) {
+                // a single-file stripped bundle has no PLE shard to point at
+                throw std::runtime_error("stripped bundle PLE companion requires split.count=2");
             }
-            const size_t slash = fname.find_last_of("/\\");
-            const std::string path = (slash == std::string::npos ? "" : fname.substr(0, slash + 1)) + companion;
-            if (!splits.empty() && (splits.size() != 2 || splits[0] != fname || splits[1] != path)) {
-                throw std::runtime_error("stripped bundle split list conflicts with its PLE companion");
-            }
-            splits = { fname, path };
         }
         // Load additional GGML contexts
         if (n_split > 1) {
@@ -742,6 +747,7 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     get_key("betelgeuse.stripped_experts", stripped_experts, false);
+    get_key("betelgeuse.mtp_dense", mtp_dense, false);
     if (stripped_experts && fname.empty()) {
         throw std::runtime_error("stripped expert model requires a filename to locate its PLE companion");
     }

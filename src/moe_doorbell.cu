@@ -6,8 +6,10 @@
 extern "C" {
     void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
 }
-#include <cuda_runtime.h>
+#include "moe_cuda_compat.h"
+#if !defined(GGML_USE_HIP)
 #include <cuda.h>
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -69,23 +71,47 @@ static uint64_t * g_lru_dev = nullptr;
 static uint64_t * g_lru_epoch = nullptr;
 
 __device__ __forceinline__ uint32_t pci_ld_u32(const volatile uint32_t * addr) {
+#if defined(__HIP_PLATFORM_AMD__)
+    // system scope bypasses the GPU L2, which otherwise holds its own copy of
+    // host-mapped bytes on gfx12
+    return __hip_atomic_load((uint32_t *) addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     uint32_t val;
     asm volatile("ld.sys.relaxed.u32 %0, [%1];" : "=r"(val) : "l"(addr));
     return val;
+#endif
 }
 
 __device__ __forceinline__ uint64_t pci_ld_u64(const volatile uint64_t * addr) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __hip_atomic_load((uint64_t *) addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     uint64_t val;
     asm volatile("ld.sys.relaxed.u64 %0, [%1];" : "=l"(val) : "l"(addr));
     return val;
+#endif
 }
 
 __device__ __forceinline__ void pci_st_u32(volatile uint32_t * addr, uint32_t val) {
+#if defined(__HIP_PLATFORM_AMD__)
+    __hip_atomic_store((uint32_t *) addr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     asm volatile("st.sys.relaxed.u32 [%0], %1;" :: "l"(addr), "r"(val));
+#endif
+}
+
+__device__ __forceinline__ void pci_st_u64(volatile uint64_t * addr, uint64_t val) {
+#if defined(__HIP_PLATFORM_AMD__)
+    __hip_atomic_store((uint64_t *) addr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    asm volatile("st.sys.relaxed.u64 [%0], %1;" :: "l"(addr), "l"(val));
+#endif
 }
 
 __device__ __forceinline__ void doorbell_spin() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__)
+    __builtin_amdgcn_s_sleep(1);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("nanosleep.u32 %0;" :: "r"(250));
 #endif
 }
@@ -182,7 +208,7 @@ __global__ void moe_resolve_slots_kernel(
             const int32_t expert = *(const int32_t *) (topk + (size_t) selected_token * topk_nb1 + (size_t) selected_rank * topk_nb0);
             if (expert >= 0 && expert < n_exp) {
                 uint64_t * address = lru_touch + (size_t) layer * n_exp + expert;
-                asm volatile("st.sys.relaxed.u64 [%0], %1;" :: "l"(address), "l"(epoch));
+                pci_st_u64(address, epoch);
             }
         }
         __threadfence_system();
@@ -418,8 +444,12 @@ void moe_doorbell_resolve_launch(
 
     cudaStream_t s = (cudaStream_t) stream;
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+#if defined(GGML_USE_HIP)
+    const bool use_dma = g_dma_done != nullptr;
+#else
     if (g_dma_done) GGML_ASSERT(cudaStreamIsCapturing(s, &capture_status) == cudaSuccess);
     const bool use_dma = g_dma_done && capture_status == cudaStreamCaptureStatusActive;
+#endif
     if (op == GGML_OP_MOE_SLOT_PREKICK) {
         moe_prekick_kernel<<<1, 32, 0, s>>>(
             (const char *) topk, (char *) out, g_prekick_dev, il, (int) nk, topk_nb0, out_nb0);
@@ -480,6 +510,12 @@ void moe_doorbell_signal_unblock(int il, void * stream) {
 static bool moe_doorbell_dma_init() {
     const char * dma_env = getenv("MOE_DMA");
     if ((dma_env && atoi(dma_env) == 0) || g_dma_done || !g_stage_host || g_n_layer <= 0) return true;
+#if defined(GGML_USE_HIP)
+    // the 4-byte completion flag copy is serialized behind the spinning kernel
+    // on HIP, so DMA stays off unless MOE_DMA_HIP asks for it
+    const char * hip_dma = getenv("MOE_DMA_HIP");
+    if (!hip_dma || atoi(hip_dma) == 0) return true;
+#endif
     cudaError_t error = cudaGetDevice(&g_device);
     if (error == cudaSuccess) error = cudaStreamCreateWithFlags(&g_stream_h2d, cudaStreamNonBlocking);
     if (error == cudaSuccess) error = cudaMalloc((void **) &g_dma_done, (size_t) g_n_layer * MOE_DOORBELL_PLAN_MAX * sizeof(uint32_t));

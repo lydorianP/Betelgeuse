@@ -731,6 +731,8 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
     bool stripped_experts = false;
+    // the NextN (MTP) block keeps its expert weights inline in the dense GGUF
+    bool mtp_dense = false;
     std::string source_path;
 
     // list of devices used in this model

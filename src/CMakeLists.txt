@@ -78,6 +78,20 @@ if (GGML_CUDA)
     target_link_directories(llama PRIVATE ${_cmake_CUDAToolkit_library_directories})
     # moe_pager.cpp issues O_DIRECT reads through io_uring
     target_link_libraries(llama PRIVATE uring)
+elseif (GGML_HIP)
+    enable_language(HIP)
+    # hip::host is an imported target, scoped to the directory that finds it
+    find_package(hip REQUIRED)
+    target_sources(llama PRIVATE moe_predictor.cu moe_doorbell.cu)
+    set_source_files_properties(moe_predictor.cu moe_doorbell.cu
+        PROPERTIES LANGUAGE HIP SKIP_UNITY_BUILD_INCLUSION ON)
+    # ggml-hip adds GGML_USE_HIP in its own directory only
+    target_compile_definitions(llama PRIVATE GGML_USE_HIP)
+    if (NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+    endif()
+    set_target_properties(llama PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+    target_link_libraries(llama PRIVATE hip::host uring)
 endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

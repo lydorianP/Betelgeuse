@@ -11,7 +11,7 @@
 #include "gguf.h"
 
 #include <liburing.h>
-#include <cuda_runtime.h>
+#include "moe_cuda_compat.h"
 
 #include <algorithm>
 #include <fstream>
@@ -256,6 +256,8 @@ bool moe_pager::use_pack(const char * experts_bin, bool aligned, std::string & e
     if (fd < 0) { err = "cannot open experts.bin with O_DIRECT"; return false; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t) st.st_size != total) {
+        LLAMA_LOG_ERROR("%s: pack byte size mismatch: have %lld, expected %llu (aligned=%d)\n",
+                __func__, (long long) st.st_size, (unsigned long long) total, (int) aligned);
         close(fd);
         err = "expert pack byte size does not match the GGUF layout"; return false;
     }

@@ -112,6 +112,7 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
     bool stripped_experts = false;
+    bool mtp_dense = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

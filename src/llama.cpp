@@ -339,6 +339,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         model->stripped_experts = ml.stripped_experts;
+        model->mtp_dense = ml.mtp_dense;
         model->source_path = fname;
 
         // loading time will be recalculated after the first eval, so

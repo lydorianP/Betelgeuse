@@ -1,8 +1,7 @@
 #include "moe_predictor.h"
 #include "llama-impl.h"
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "moe_cuda_compat.h"
 
 #include <cstdio>
 #include <cstdlib>

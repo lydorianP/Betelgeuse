@@ -148,6 +148,9 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        if (stripped_experts && !mtp_dense) {
+            throw std::runtime_error("MTP layers are not paged; disable MTP for a stripped expert model");
+        }
         return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
